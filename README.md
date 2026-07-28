@@ -1,0 +1,95 @@
+# DemandSense AI — MVP
+### Intelligent Retail Demand Pattern Recognition & Sales Forecasting System
+
+A working, end-to-end MVP of the project spec: data cleaning → feature
+engineering → pattern-recognition clustering → anomaly detection →
+demand forecasting (XGBoost + LightGBM) → SHAP explainability → an
+interactive Streamlit dashboard, with MLflow experiment tracking.
+
+## Why synthetic data
+This MVP ships with a **synthetic, M5-style dataset generator**
+(`src/generate_data.py`) instead of a downloaded Kaggle file, so the
+whole pipeline runs immediately with no external downloads or Kaggle
+auth needed. It reproduces the structures you'd get from M5 / Rossmann
+/ Walmart: multiple stores, multiple product categories, calendar
+effects (weekends, holidays, a festive quarter), promotions, and
+price/discount behaviour — including deliberately injected demand
+spikes/drops, missing values, and duplicate rows so the cleaning and
+anomaly-detection steps have something real to do.
+
+**To use a real dataset** (M5, Rossmann, Walmart from Kaggle), drop the
+CSVs in `data/` and adjust `src/generate_data.py`'s output schema to
+match — the rest of the pipeline (`features.py` onward) only needs
+these columns:
+`date, store_id, product_id, category, region, price, base_price, promo_flag, is_holiday, is_festival, units_sold`
+
+## Project structure
+```
+demandsense-mvp/
+├── data/                      # generated (or real) raw data
+├── src/
+│   ├── generate_data.py       # synthetic M5-style data generator
+│   ├── features.py            # Step 1 & 3: cleaning + feature engineering
+│   ├── clustering.py          # Step 4: product pattern clustering (K-Means)
+│   ├── anomaly.py             # Step 5: anomaly detection (Isolation Forest)
+│   ├── forecasting.py         # Step 6: XGBoost + LightGBM forecasting
+│   ├── explainability.py      # Step 7: SHAP explainability
+│   └── run_pipeline.py        # orchestrates all steps, saves artifacts
+├── artifacts/                 # models, predictions, metrics (pipeline output)
+├── app.py                     # Step 8: Streamlit dashboard
+├── requirements.txt
+└── mlruns / mlflow.db         # MLflow experiment tracking (created on run)
+```
+
+## Setup
+```bash
+pip install -r requirements.txt
+```
+
+## Run the pipeline
+```bash
+cd demandsense-mvp
+python src/generate_data.py     # ~176K rows: 60 products x 4 stores x 730 days
+python src/run_pipeline.py      # cleans, engineers features, clusters,
+                                 # detects anomalies, trains + evaluates,
+                                 # computes SHAP, saves everything to artifacts/
+```
+Console output includes cluster centroids, anomaly counts, RMSE/MAE/MAPE
+for both models, and top SHAP features. A full run takes well under a
+minute on a laptop.
+
+To inspect experiment runs:
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+## Run the dashboard
+```bash
+streamlit run app.py
+```
+Six tabs, filterable by region / category / product / store:
+- **Sales Forecast** — actual vs. XGBoost/LightGBM predictions on the held-out test window, plus model metrics
+- **Demand Trend** — historical series with promo/holiday markers, rolling stats, weekday seasonality
+- **Product Clusters** — the K-Means scatter of demand level vs. volatility, cluster centroids, similar products
+- **SHAP Explanation** — global feature importance + a plain-language breakdown of the most recent prediction
+- **Anomaly Alerts** — flagged spikes/drops, anomaly-type breakdown, per-product anomaly markers
+- **Region-wise Sales** — regional trend lines, share of sales, category mix per region
+
+## What's genuinely MVP vs. what's a next step
+This is a real, runnable pipeline — not a mockup — but scoped down from
+the full spec on purpose:
+- **Prophet and LSTM** are named in the target stack but not wired in
+  here; XGBoost + LightGBM already cover the "compare gradient-boosted
+  models" story and keep the MVP fast to run. Prophet is a natural next
+  addition per-product for long-horizon/holiday-heavy series.
+- **SHAP** runs on a sampled subset of rows (`sample_size=3000` in
+  `explainability.py`) for speed; drop the sampling for a full run.
+- **MAPE on the synthetic data** lands around ~40-50%, not the <10%
+  quoted in the resume bullets — expected, since synthetic Poisson-type
+  noise at low-volume product/store combinations is inherently noisier
+  than the aggregated series in the real Kaggle datasets. Point the
+  pipeline at the real M5/Rossmann/Walmart data to get numbers you can
+  actually put on a resume.
+- No hyperparameter tuning, no per-cluster or per-product model
+  routing, no CI/CD or containerization yet — reasonable "day 2" work
+  once the MVP is validated.
