@@ -8,8 +8,13 @@ import numpy as np
 import pandas as pd
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Missing values, duplicates, date handling, basic outlier capping."""
+def clean_data(df: pd.DataFrame, cap_cutoff_date=None) -> pd.DataFrame:
+    """Missing values, duplicates, date handling, basic outlier capping.
+
+    cap_cutoff_date: if given, the per-product 1st/99th percentile caps are
+    fitted only on rows with date <= cap_cutoff_date (training period) and
+    then applied to all rows, so the test window does not leak into the caps.
+    """
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
 
@@ -31,11 +36,11 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Cap extreme outliers at the 1st/99th percentile *per product* (winsorize),
     # rather than deleting them -- true anomalies are handled later by Isolation Forest.
-    def winsorize(s):
-        lo, hi = s.quantile(0.01), s.quantile(0.99)
-        return s.clip(lo, hi)
-
-    df["units_sold_capped"] = df.groupby("product_id")["units_sold"].transform(winsorize)
+    fit_rows = df if cap_cutoff_date is None else df[df["date"] <= pd.Timestamp(cap_cutoff_date)]
+    caps = fit_rows.groupby("product_id")["units_sold"].quantile([0.01, 0.99]).unstack()
+    lo = df["product_id"].map(caps[0.01])
+    hi = df["product_id"].map(caps[0.99])
+    df["units_sold_capped"] = df["units_sold"].clip(lo, hi)
 
     meta = {"duplicates_removed": int(dupes_removed), "rows_after_clean": len(df)}
     return df, meta
@@ -81,8 +86,8 @@ def add_price_and_promo_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_feature_table(raw: pd.DataFrame):
-    df, clean_meta = clean_data(raw)
+def build_feature_table(raw: pd.DataFrame, cap_cutoff_date=None):
+    df, clean_meta = clean_data(raw, cap_cutoff_date=cap_cutoff_date)
     df = add_calendar_features(df)
     df = add_lag_and_rolling_features(df)
     df = add_price_and_promo_features(df)
