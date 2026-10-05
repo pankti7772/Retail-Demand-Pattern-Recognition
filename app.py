@@ -45,6 +45,21 @@ def load_models():
     return feature_cols, xgb_model, explainer
 
 
+@st.cache_data
+def load_evaluation():
+    """Evaluation artifacts written by the pipeline (read-only; nothing is recomputed here)."""
+    try:
+        comparison = pd.read_csv(f"{ARTIFACT_DIR}/model_comparison.csv")
+        folds = pd.read_csv(f"{ARTIFACT_DIR}/rolling_cv_folds.csv", parse_dates=["train_end", "test_start", "test_end"])
+        with open(f"{ARTIFACT_DIR}/baseline_metrics.json") as f:
+            baselines = json.load(f)
+        with open(f"{ARTIFACT_DIR}/rolling_cv_summary.json") as f:
+            cv_summary = json.load(f)
+    except FileNotFoundError:
+        return None
+    return comparison, folds, baselines, cv_summary
+
+
 try:
     model_df, clustered_products, test_pred, importance, centroids, metrics, clean_meta = load_data()
     feature_cols, xgb_model, explainer = load_models()
@@ -100,6 +115,7 @@ k4.metric("Cluster", cluster_name)
 tabs = st.tabs([
     "📈 Sales Forecast", "📊 Demand Trend", "🧩 Product Clusters",
     "🔍 SHAP Explanation", "🚨 Anomaly Alerts", "🗺️ Region-wise Sales",
+    "🧪 Evaluation & Model Comparison",
 ])
 
 # ------------------------------------------------------------- 1. Forecast --
@@ -245,3 +261,116 @@ with tabs[5]:
         region_cat = model_df.groupby(["region", "category"])["units_sold_capped"].sum().reset_index()
         fig3 = px.bar(region_cat, x="region", y="units_sold_capped", color="category", title="Category mix by region", barmode="stack")
         st.plotly_chart(fig3, use_container_width=True)
+
+# ------------------------------------------ 7. Evaluation & Model Comparison --
+with tabs[6]:
+    st.subheader("Evaluation & Model Comparison")
+    st.caption(
+        "All metrics on this page are evaluation results on a **synthetic** retail dataset. "
+        "They do not represent real-world retail performance."
+    )
+    eval_artifacts = load_evaluation()
+    if eval_artifacts is None:
+        st.info("Evaluation artifacts not found. Re-run `python src/run_pipeline.py` to generate them.")
+    else:
+        comparison, cv_folds, baseline_metrics, cv_summary = eval_artifacts
+        ML_MODELS = ["xgboost", "lightgbm"]
+        LABELS = {
+            "xgboost": "XGBoost", "lightgbm": "LightGBM", "naive_lag1": "Naive (lag-1)",
+            "seasonal_naive_lag7": "Seasonal-Naive (lag-7)", "moving_avg_7": "7-Day Moving Average",
+        }
+        best_baseline = min(baseline_metrics, key=lambda m: baseline_metrics[m]["MAE"])
+        bb = baseline_metrics[best_baseline]
+
+        cmp_df = comparison.set_index("model")
+        cmp_df["RMSE_improvement_vs_best_baseline_pct"] = (bb["RMSE"] - cmp_df["RMSE"]) / bb["RMSE"] * 100
+        order = ML_MODELS + [m for m in cmp_df.index if m not in ML_MODELS]
+        cmp_df = cmp_df.loc[order]
+
+        # ---- headline: best baseline and improvement over it
+        h1, h2, h3 = st.columns(3)
+        h1.metric("Best baseline (lowest MAE)", LABELS.get(best_baseline, best_baseline), f"MAE {bb['MAE']:.2f}", delta_color="off")
+        for col, m in zip((h2, h3), ML_MODELS):
+            col.metric(
+                f"{LABELS[m]} MAE vs. best baseline",
+                f"{cmp_df.loc[m, 'MAE']:.2f}",
+                f"{cmp_df.loc[m, 'MAE_improvement_vs_best_baseline_pct']:.1f}% lower MAE",
+            )
+
+        # ---- comparison table
+        st.markdown("**Holdout comparison (60-day time-based holdout, one-day-ahead forecasts)**")
+        table = pd.DataFrame({
+            "Model": [LABELS.get(m, m) for m in cmp_df.index],
+            "Type": ["ML model" if m in ML_MODELS else ("Best baseline" if m == best_baseline else "Baseline") for m in cmp_df.index],
+            "MAE": cmp_df["MAE"].values,
+            "RMSE": cmp_df["RMSE"].values,
+            "MAPE (%)": cmp_df["MAPE"].values,
+            "MAE improvement vs. best baseline (%)": cmp_df["MAE_improvement_vs_best_baseline_pct"].values,
+            "RMSE improvement vs. best baseline (%)": cmp_df["RMSE_improvement_vs_best_baseline_pct"].values,
+        })
+
+        def _highlight(row):
+            color = {"ML model": "rgba(46,160,67,0.18)", "Best baseline": "rgba(210,153,34,0.22)"}.get(row["Type"], "")
+            return [f"background-color: {color}" if color else ""] * len(row)
+
+        st.dataframe(
+            table.style.apply(_highlight, axis=1).format({c: "{:.2f}" for c in table.columns if c not in ("Model", "Type")}),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption(
+            "Green = ML models, amber = best baseline. MAE improvement is read from `model_comparison.csv`; "
+            "RMSE improvement is the relative difference between the table's RMSE values and the best baseline's RMSE."
+        )
+
+        # ---- MAE / RMSE chart
+        chart_df = table.melt(id_vars="Model", value_vars=["MAE", "RMSE"], var_name="Metric", value_name="Value")
+        fig = px.bar(chart_df, x="Model", y="Value", color="Metric", barmode="group", text_auto=".1f",
+                     category_orders={"Model": table["Model"].tolist()},
+                     labels={"Value": "Error (units)"})
+        fig.update_layout(height=380, legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ---- rolling-origin validation
+        st.markdown("**3-fold expanding-window validation (mean ± std across folds)**")
+        rows = []
+        for m in ML_MODELS:
+            row = {"Model": LABELS[m]}
+            for metric, label in (("MAE", "MAE"), ("RMSE", "RMSE"), ("MAPE", "MAPE (%)")):
+                stat = cv_summary[f"{m}_{metric}"]
+                row[label] = f"{stat['mean']:.2f} ± {stat['std']:.2f}"
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("**Validation windows (time-based, no random split)**")
+        data_start = model_df["date"].min()
+        win = []
+        for _, r in cv_folds.iterrows():
+            win.append({"Fold": f"Fold {int(r['fold'])}", "Phase": "Train (expanding)", "Start": data_start, "End": r["train_end"] + pd.Timedelta(days=1)})
+            win.append({"Fold": f"Fold {int(r['fold'])}", "Phase": "Test", "Start": r["test_start"], "End": r["test_end"] + pd.Timedelta(days=1)})
+        fig_w = px.timeline(pd.DataFrame(win), x_start="Start", x_end="End", y="Fold", color="Phase")
+        fig_w.update_yaxes(autorange="reversed", title=None)
+        fig_w.update_layout(height=260, legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(fig_w, use_container_width=True)
+
+        fold_table = pd.DataFrame({
+            "Fold": cv_folds["fold"],
+            "Train end": cv_folds["train_end"].dt.date,
+            "Test window": cv_folds["test_start"].dt.strftime("%Y-%m-%d") + " → " + cv_folds["test_end"].dt.strftime("%Y-%m-%d"),
+            "Train rows": cv_folds["n_train"],
+            "Test rows": cv_folds["n_test"],
+            "XGB MAE": cv_folds["xgboost_MAE"], "XGB RMSE": cv_folds["xgboost_RMSE"], "XGB MAPE (%)": cv_folds["xgboost_MAPE"],
+            "LGBM MAE": cv_folds["lightgbm_MAE"], "LGBM RMSE": cv_folds["lightgbm_RMSE"], "LGBM MAPE (%)": cv_folds["lightgbm_MAPE"],
+        })
+        num_cols = [c for c in fold_table.columns if c.startswith(("XGB", "LGBM"))]
+        st.dataframe(fold_table.style.format({c: "{:.2f}" for c in num_cols}), use_container_width=True, hide_index=True)
+        st.caption("The last fold uses the same split as the main 60-day holdout.")
+
+        # ---- methodology
+        st.markdown("**Methodology**")
+        st.markdown(
+            "- Synthetic retail dataset (M5-style), not real retail data\n"
+            "- 60-day time-based holdout\n"
+            "- One-day-ahead forecasting\n"
+            "- Baseline benchmarking: naive (lag-1), seasonal-naive (lag-7), 7-day moving average, scored on the same holdout rows\n"
+            "- 3-fold expanding-window (rolling-origin) validation, 60-day test window per fold"
+        )

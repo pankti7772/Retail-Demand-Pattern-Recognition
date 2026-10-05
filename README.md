@@ -81,6 +81,39 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db
   `artifacts/rolling_cv_summary.json`, per-fold in `artifacts/rolling_cv_folds.csv`.
 - Everything above is logged to MLflow (`demandsense-ai-mvp` experiment).
 
+## Performance (synthetic data)
+> These are evaluation results on the **synthetic** dataset from
+> `src/generate_data.py`. They do not indicate real-world forecasting accuracy.
+
+### 60-day holdout results
+Test window 2025-11-01 → 2025-12-30, 14,400 rows, one-day-ahead forecasts.
+
+| Model | MAE | RMSE | MAPE |
+|---|---|---|---|
+| LightGBM | 22.19 | 35.10 | 48.50% |
+| XGBoost | 22.43 | 35.46 | 48.46% |
+| 7-day Moving Average (baseline) | 25.27 | 39.23 | 53.20% |
+| Seasonal Naive, lag-7 (baseline) | 33.04 | 51.19 | 65.23% |
+| Naive, lag-1 (baseline) | 33.42 | 52.17 | 65.22% |
+
+- The **7-day moving average is the strongest baseline by MAE**.
+- XGBoost reduces MAE by approximately **11.2%** versus the best baseline.
+- LightGBM reduces MAE by approximately **12.2%** versus the best baseline.
+- XGBoost and LightGBM perform very similarly. No statistical significance
+  test was performed, so LightGBM is **not** claimed to be significantly
+  better than XGBoost.
+
+### 3-fold expanding-window validation (cross-validation means, not holdout results)
+Mean ± standard deviation across the 3 rolling-origin folds:
+
+| Model | Mean MAE (CV) |
+|---|---|
+| XGBoost | 21.06 ± 1.36 |
+| LightGBM | 20.98 ± 1.24 |
+
+Full per-fold MAE/RMSE/MAPE: `artifacts/rolling_cv_folds.csv` and
+`artifacts/rolling_cv_summary.json`.
+
 ## Run the dashboard
 ```bash
 streamlit run app.py
@@ -102,7 +135,7 @@ the full spec on purpose:
   addition per-product for long-horizon/holiday-heavy series.
 - **SHAP** runs on a sampled subset of rows (`sample_size=3000` in
   `explainability.py`, drawn from the test window) for speed; drop the sampling for a full run.
-- **MAPE on the synthetic data** lands around ~40-50%, not the <10%
+- **MAPE on the synthetic data** is ~48.5% on the 60-day holdout (see Performance), not the <10%
   quoted in the resume bullets — expected, since synthetic Poisson-type
   noise at low-volume product/store combinations is inherently noisier
   than the aggregated series in the real Kaggle datasets. Point the
